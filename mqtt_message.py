@@ -54,6 +54,7 @@ class MQTTControlPacket:
         UNSUBACK,
     ]
 
+    unparsed = ''
     def __init__(self, packet):
         self._packet = packet
         # Fixed header
@@ -62,6 +63,13 @@ class MQTTControlPacket:
         self.packet_type_human = self.Names[self.packet_type]
         self.dup, self.qos, self.retain = self._parse_flags()
         self.remaining_length, self.total_length = self._parse_remaining_length()
+# The remaining_length only gives the data,
+# it is possible that one tcp packet contains multiple mqtt packets
+# capture the unparsed stuff
+        if self.total_length < len(packet):
+            self.unparsed = packet[self.total_length:]
+            self._packet  = packet[:self.total_length]
+
         if self.total_length > len(packet):
             # Partial packet, raise BlockingIOError (the Python error than best corresponds to errno EAGAIN)
             raise BlockingIOError(f'Incomplete MQTT control packet: only {len(packet)} bytes remaining, but header expected {self.total_length}', len(packet))
@@ -263,8 +271,12 @@ Password: {strutils.bytes_to_escaped_str(self.payload.get('Password', b'None'))}
 def tcp_message(flow: tcp.TCPFlow | http.HTTPFlow):
     message = flow.messages[-1]
 
-    mqtt_packet = MQTTControlPacket(message.content)
-    dump(mqtt_packet)
+    data = message.content
+    while data:
+        mqtt_packet = MQTTControlPacket(data)
+        dump(mqtt_packet)
+        data = mqtt_packet.unparsed
+
 
 
 def dump(mqtt_packet: MQTTControlPacket):
@@ -306,12 +318,16 @@ def websocket_message(flow: http.HTTPFlow):
     ws_buffer[fid] += flow.websocket.messages[-1].content
     while ws_buffer[fid]:
         try:
-            mqtt_packet = MQTTControlPacket(ws_buffer[fid])
+            data = ws_buffer[fid]
+            while data:
+                mqtt_packet = MQTTControlPacket(data)
+                dump(mqtt_packet)
+                data = mqtt_packet.unparsed
+
         except BlockingIOError as exc:
             ctx.log.debug("Awaiting more bytes for complete MQTT control packet")
             break
         else:
-            dump(mqtt_packet)
-            b = ws_buffer[fid] = mqtt_packet._extra
+            b = ws_buffer[fid] = mqtt_packet._extra # Not 100% about the logic here -- check
             if b:
                 ctx.log.debug(f'Saving remaining {len(b)} bytes after MQTT control packet')
